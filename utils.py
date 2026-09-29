@@ -5,21 +5,98 @@ import torch.nn as nn
 import random
 import string
 import argparse
-from chamferdist import ChamferDistance
+try:
+    from chamferdist import ChamferDistance
+except ImportError:
+    ChamferDistance = None
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from typing import List, Optional, Tuple, Union
 
-from OCC.Core.gp import gp_Pnt, gp_Pnt
-from OCC.Core.TColgp import TColgp_Array2OfPnt
-from OCC.Core.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_PointsToBSpline
-from OCC.Core.GeomAbs import GeomAbs_C2
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge
-from OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
-from OCC.Core.TColgp import TColgp_Array1OfPnt
-from OCC.Core.gp import gp_Pnt
-from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Edge
-from OCC.Core.ShapeAnalysis import ShapeAnalysis_Wire
-from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+# from OCC.Core.gp import gp_Pnt, gp_Pnt
+# from OCC.Core.TColgp import TColgp_Array2OfPnt
+# from OCC.Core.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_PointsToBSpline
+# from OCC.Core.GeomAbs import GeomAbs_C2
+# from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeWire, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeEdge
+# from temp.OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
+# from OCC.Core.TColgp import TColgp_Array1OfPnt
+# from OCC.Core.gp import gp_Pnt
+# from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Edge
+# from OCC.Core.ShapeAnalysis import ShapeAnalysis_Wire
+# from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+try:
+    from OCC.Core.gp import gp_Pnt
+    from OCC.Core.TColgp import TColgp_Array2OfPnt, TColgp_Array1OfPnt
+    from OCC.Core.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_PointsToBSpline
+    from OCC.Core.GeomAbs import GeomAbs_C2
+    from OCC.Core.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeWire,
+        BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeEdge,
+        BRepBuilderAPI_Sewing,
+        BRepBuilderAPI_MakeSolid,
+    )
+    from OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
+    from OCC.Core.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Edge
+    from OCC.Core.ShapeAnalysis import ShapeAnalysis_Wire
+    from OCC.Core.TopoDS import topods, TopoDS_Face, TopoDS_Shell
+    from OCC.Core.TopAbs import TopAbs_SHELL, TopAbs_WIRE
+    from OCC.Core.TopExp import TopExp_Explorer
+
+    def to_face(shape):
+        try:
+            return shape if isinstance(shape, TopoDS_Face) else topods.Face(shape)
+        except Exception:
+            return shape
+
+except ModuleNotFoundError:
+    from OCP.gp import gp_Pnt
+    from OCP.TColgp import TColgp_Array2OfPnt, TColgp_Array1OfPnt
+    from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface, GeomAPI_PointsToBSpline
+    from OCP.GeomAbs import GeomAbs_Shape
+    GeomAbs_C2 = GeomAbs_Shape.GeomAbs_C2
+    from OCP.BRepBuilderAPI import (
+        BRepBuilderAPI_MakeWire,
+        BRepBuilderAPI_MakeFace,
+        BRepBuilderAPI_MakeEdge,
+        BRepBuilderAPI_Sewing,
+        BRepBuilderAPI_MakeSolid,
+    )
+    from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Wire, ShapeFix_Edge
+    from OCP.ShapeAnalysis import ShapeAnalysis_Wire
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_WIRE, TopAbs_SHELL
+    from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Shell
+    from OCP.BRepTools import BRepTools_WireExplorer
+
+    def to_face(shape):
+        try:
+            return shape if isinstance(shape, TopoDS_Face) else TopoDS.Face_s(shape)
+        except Exception:
+            return shape
+
+    class TopologyExplorer:
+        def __init__(self, shape):
+            self.shape = shape
+
+        def wires(self):
+            exp = TopExp_Explorer(self.shape, TopAbs_WIRE)
+            res = []
+            while exp.More():
+                res.append(TopoDS.Wire_s(exp.Current()))
+                exp.Next()
+            return res
+
+    class WireExplorer:
+        def __init__(self, wire):
+            self.wire = wire
+
+        def ordered_edges(self):
+            exp = BRepTools_WireExplorer(self.wire)
+            res = []
+            while exp.More():
+                res.append(exp.Current())
+                exp.Next()
+            return res
 
 
 def generate_random_string(length):
@@ -669,11 +746,71 @@ def get_bbox_minmax(point_cloud):
     return (min_point, max_point)
 
 
-def joint_optimize(surf_ncs, edge_ncs, surfPos, unique_vertices, EdgeVertexAdj, FaceEdgeAdj, num_edge, num_surf):
+def ChamferDistance_batch(X, Y, bidirectional=False, reverse=False, batch_reduction: Optional[str] = "mean", 
+                          point_reduction: Optional[str] = "sum") -> torch.Tensor:
+    """
+    Local PyTorch Chamfer distance computation from PR #23.
+    Args:
+        - X: Tensor of shape (B, N, d) representing a batch of point clouds.
+        - Y: Tensor of shape (B, M, d) representing a batch of point clouds.
+        - bidirectional: If True, compute the Chamfer distance in both directions and average the results.
+        - reverse: If False, the Chamfer distance is computed based on the nearest neighbor point in y in Y for each point in x in X; and vice versa if True.
+        - batch_reduction: Method used to reduce the distance between points in a batch. Can be "sum" or "mean".
+        - point_reduction: Method used to reduce the distance between points in a point cloud. Can be "sum" or "mean".
+    """
+    xx = torch.bmm(X, X.transpose(2, 1))    # [b, N, N]
+    yy = torch.bmm(Y, Y.transpose(2, 1))    # [b, M, M]
+    zz = torch.bmm(X, Y.transpose(2, 1))    # [b, N, M]
+    diag_ind = torch.arange(0, X.size()[1]).to(X).long()
+    diag_ind_2 = torch.arange(0, Y.size()[1]).to(X).long()
+    rx = xx[:, diag_ind, diag_ind].unsqueeze(2).expand_as(zz)   # [b, N] -> [b, N, 1] -> [b, N, M]
+    ry = yy[:, diag_ind_2, diag_ind_2].unsqueeze(1).expand_as(zz)   # [b, N] -> [b, 1, N] -> [b, N, M]
+    P = (rx + ry - 2 * zz)  # [b, N, M]
+
+    if reverse:
+        P_back = P.transpose(1, 2)
+
+    P = P.min(2)[0] # [b, N]
+    if reverse:
+        P_back = P_back.min(2)[0]   # [b, M]
+    if point_reduction == "sum":
+        P = P.sum(1)    # [b]
+        if reverse:
+            P_back = P_back.sum(1)  # [b]
+    elif point_reduction == "mean":
+        P = P.mean(1)
+        if reverse:
+            P_back = P_back.mean(1)
+    else:
+        raise ValueError("Invalid point reduction")
+    
+    if batch_reduction == "sum":
+        P = P.sum()
+        if reverse:
+            P_back = P_back.sum()
+    elif batch_reduction == "mean":
+        P = P.mean()
+        if reverse:
+            P_back = P_back.mean()
+    else:
+        raise ValueError("Invalid batch reduction")
+
+    if bidirectional:
+        return P + P_back
+    elif reverse:
+        return P_back
+    else:
+        return P
+
+
+def joint_optimize(surf_ncs, edge_ncs, surfPos, unique_vertices, EdgeVertexAdj, FaceEdgeAdj, num_edge, num_surf, use_local_cd=False):
     """
     Jointly optimize the face/edge/vertex based on topology
     """
-    loss_func = ChamferDistance()
+    if use_local_cd or ChamferDistance is None:
+        loss_func = ChamferDistance_batch
+    else:
+        loss_func = ChamferDistance()
 
     model = STModel(num_edge, num_surf)
     model = model.cuda().train()
@@ -777,6 +914,7 @@ def joint_optimize(surf_ncs, edge_ncs, surfPos, unique_vertices, EdgeVertexAdj, 
 
 
 def add_pcurves_to_edges(face):
+    face = to_face(face)
     edge_fixer = ShapeFix_Edge()
     top_exp = TopologyExplorer(face)
     for wire in top_exp.wires():
@@ -786,6 +924,7 @@ def add_pcurves_to_edges(face):
 
 
 def fix_wires(face, debug=False):
+    face = to_face(face)
     top_exp = TopologyExplorer(face)
     for wire in top_exp.wires():
         if debug:
@@ -806,6 +945,7 @@ def fix_wires(face, debug=False):
 
 
 def fix_face(face):
+    face = to_face(face)
     fixer = ShapeFix_Face(face)
     fixer.SetPrecision(0.01)
     fixer.SetMaxTolerance(0.1)
@@ -920,15 +1060,19 @@ def construct_brep(surf_wcs, edge_wcs, FaceEdgeAdj, EdgeVertexAdj):
             inner_wires.append(wire_builder.Wire())
     
         # Cut by wires
-        face_builder = BRepBuilderAPI_MakeFace(surface, outer_wire)
-        for wire in inner_wires:
-            face_builder.Add(wire)
-        face_occ = face_builder.Shape()
-        fix_wires(face_occ)
-        add_pcurves_to_edges(face_occ)
-        fix_wires(face_occ)
-        face_occ = fix_face(face_occ)
-        post_faces.append(face_occ)
+        try:
+            face_builder = BRepBuilderAPI_MakeFace(surface, outer_wire)
+            for wire in inner_wires:
+                face_builder.Add(wire)
+            face_occ = to_face(face_builder.Face() if face_builder.IsDone() else face_builder.Shape())
+            fix_wires(face_occ)
+            add_pcurves_to_edges(face_occ)
+            fix_wires(face_occ)
+            face_occ = fix_face(face_occ)
+            post_faces.append(face_occ)
+        except Exception as e:
+            print(f"Face construction / fixing failed: {e}")
+            continue
 
     # Sew faces into solid 
     sewing = BRepBuilderAPI_Sewing()
@@ -941,8 +1085,21 @@ def construct_brep(surf_wcs, edge_wcs, FaceEdgeAdj, EdgeVertexAdj):
 
     # Make a solid from the shell
     maker = BRepBuilderAPI_MakeSolid()
-    maker.Add(sewn_shell)
-    maker.Build()
-    solid = maker.Solid()
+    try:
+        if isinstance(sewn_shell, TopoDS_Shell):
+            maker.Add(sewn_shell)
+        else:
+            try:
+                maker.Add(TopoDS.Shell_s(sewn_shell))
+            except Exception:
+                exp = TopExp_Explorer(sewn_shell, TopAbs_SHELL)
+                while exp.More():
+                    maker.Add(TopoDS.Shell_s(exp.Current()))
+                    exp.Next()
+        maker.Build()
+        solid = maker.Solid()
+    except Exception as e:
+        print(f"Solid construction from shell failed: {e}, using sewn shell")
+        solid = sewn_shell
 
     return solid
